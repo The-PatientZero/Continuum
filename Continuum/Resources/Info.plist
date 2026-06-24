@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>SUFeedURL</key>
+	<string>https://the-patientzero.github.io/Continuum/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>fQ2kWqCLfAPAxQX1rp8gVNoG9hlAV/Gmm7kMBbxFe+A=</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.thepatientzero.Continuum</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>continuum</string>
+			</array>
+		</dict>
+	</array>
+	<key>ContinuumRepositoryURL</key>
+	<string>https://github.com/The-PatientZero/Continuum</string>
+	<key>ContinuumDonateURL</key>
+	<string>https://github.com/The-PatientZero/Continuum</string>
+	</dict>
+</plist>
