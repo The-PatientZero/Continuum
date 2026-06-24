@@ -1,0 +1,789 @@
+//
+//  MenuBarItem.swift
+//  Project: Continuum
+//
+//  Copyright © 2023–2025 Jordan Baird
+//  Copyright © 2026 Toni Förster
+//  Licensed under the GNU GPLv3
+
+import Cocoa
+import os.lock
+
+/// A structural representation of a menu bar item.
+struct MenuBarItem: CustomStringConvertible {
+    /// The tag associated with this item.
+    let tag: MenuBarItemTag
+
+    /// The item's window identifier.
+    let windowID: CGWindowID
+
+    /// The identifier of the process that owns the item.
+    let ownerPID: pid_t
+
+    /// The identifier of the process that created the item.
+    let sourcePID: pid_t?
+
+    /// The item's bounds, specified in screen coordinates.
+    let bounds: CGRect
+
+    /// The item's window title.
+    let title: String?
+
+    /// A Boolean value that indicates whether the item is on screen.
+    let isOnScreen: Bool
+
+    /// A Boolean value that indicates whether this item can be moved.
+    ///
+    /// Title-less Control Center modules are excluded: macOS refuses to drag
+    /// them, so synthesized move events time out (8 attempts each), and a saved
+    /// layout that lists them makes every apply burn the move watchdog retrying
+    /// — the menu-bar/Mission Control "pulse". Reporting them immovable here
+    /// keeps them out of the apply planner (`isLayoutItem`) and short-circuits
+    /// `move()`'s own `isMovable` guard, so no path ever attempts the drag.
+    var isMovable: Bool {
+        tag.isMovable && !isTitlelessControlCenterModule
+    }
+
+    /// A Boolean value that indicates whether this item can be hidden.
+    var canBeHidden: Bool {
+        tag.canBeHidden &&
+            !isTransientControlCenterItem &&
+            !isUnresolvedControlCenterPlaceholder
+    }
+
+    /// A Boolean value that indicates whether this item is a transient
+    /// Control Center module (e.g. Live Activities) with a generic
+    /// `Item-\d+` title. These are treated like transient capture indicators.
+    var isTransientControlCenterItem: Bool {
+        tag.isControlCenterGenericItem && sourcePID != nil
+    }
+
+    /// A Boolean value that indicates whether this item is a title-less or
+    /// generic Control Center placeholder whose real owner has not resolved.
+    var isUnresolvedControlCenterPlaceholder: Bool {
+        guard tag.namespace == .controlCenter, sourcePID == nil else {
+            return false
+        }
+
+        let effectiveTitle = title ?? tag.title
+        return effectiveTitle.isEmpty || tag.isControlCenterGenericItem
+    }
+
+    /// A Boolean value that indicates whether this item is one of Control
+    /// Center's own module windows that the Window Server reports with an
+    /// empty title (e.g. the system modules that share the Control Center
+    /// PID but never receive a resolved title).
+    ///
+    /// macOS does not let these be dragged: synthesized move events time
+    /// out on them, so a saved layout that lists them makes every apply
+    /// burn the move watchdog retrying them — the menu-bar/Mission Control
+    /// pulse. They are never user-movable, whether or not the source PID
+    /// resolved to Control Center; a resolved PID with an empty title is
+    /// still an unmanageable system module, not a normal status item. The
+    /// movable Control Center modules (Wi-Fi, Sound, etc.) always carry a
+    /// resolved title and so are unaffected.
+    var isTitlelessControlCenterModule: Bool {
+        tag.namespace == .controlCenter && (title ?? tag.title).isEmpty
+    }
+
+    /// For a Control Center module whose CG window title is empty (the normal
+    /// case without Screen Recording), a title token derived from the module's
+    /// Accessibility identifier — resolved by `SourcePIDCache` during the PID
+    /// scan, e.g. `com.apple.menuextra.wifi` → `"WiFi"`. Feeding this token to
+    /// the system-item name and symbol maps lets the editor and tray show
+    /// "Wi-Fi"/"Bluetooth"/… and the right glyph without a CG title. Nil when
+    /// the item already has a title or isn't a title-less CC module.
+    var controlCenterModuleTitle: String? {
+        guard isTitlelessControlCenterModule,
+              let windowID = tag.windowID,
+              let identifier = SourcePIDCache.shared.axIdentifier(for: windowID)
+        else {
+            return nil
+        }
+        return Self.controlCenterTitle(forMenuExtraIdentifier: identifier)
+    }
+
+    /// Maps a Control Center module's `AXIdentifier` to the internal title
+    /// token used by the system-item name/symbol maps. Known modules map to
+    /// their canonical token; unknown ones are title-cased from the suffix so
+    /// they still read sensibly.
+    static func controlCenterTitle(forMenuExtraIdentifier identifier: String) -> String? {
+        let prefix = "com.apple.menuextra."
+        guard identifier.hasPrefix(prefix) else { return nil }
+        let key = String(identifier.dropFirst(prefix.count)).lowercased()
+        switch key {
+        case "wifi": return "WiFi"
+        case "bluetooth": return "Bluetooth"
+        case "clock": return "Clock"
+        case "controlcenter": return "BentoBox-0"
+        case "battery": return "Battery"
+        case "sound", "volume": return "Sound"
+        case "display", "displaybrightness": return "Display"
+        case "nowplaying": return "NowPlaying"
+        case "screenmirroring": return "ScreenMirroring"
+        case "focusmodes", "focus": return "FocusModes"
+        case "accessibilityshortcuts": return "AccessibilityShortcuts"
+        case "userswitcher", "fastuserswitching": return "UserSwitcher"
+        case "keyboardbrightness": return "KeyboardBrightness"
+        case "hearing": return "Hearing"
+        case "musicrecognition": return "MusicRecognition"
+        case "airdrop": return "AirDrop"
+        default:
+            return key
+                .split(whereSeparator: { $0 == "-" || $0 == "." })
+                .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+                .joined()
+        }
+    }
+
+    /// A Boolean value that indicates whether this item is one of Continuum's
+    /// control items.
+    var isControlItem: Bool {
+        tag.isControlItem
+    }
+
+    /// A Boolean value that indicates whether this item is a "BentoBox"
+    /// item owned by the Control Center.
+    var isBentoBox: Bool {
+        tag.isBentoBox
+    }
+
+    /// A Boolean value that indicates whether this item is a
+    /// system-created clone of an actual item, and therefore invalid
+    /// for management.
+    var isSystemClone: Bool {
+        tag.isSystemClone
+    }
+
+    /// A Boolean value that indicates whether this is one of Continuum's
+    /// own structural status items reported without its normal control-item
+    /// title by the Window Server.
+    var isContinuumStructuralItem: Bool {
+        if isControlItem {
+            return true
+        }
+
+        let isContinuumOwned = sourceApplication?.bundleIdentifier == Constants.bundleIdentifier ||
+            tag.namespace.description == Constants.bundleIdentifier
+        guard isContinuumOwned else {
+            return false
+        }
+
+        if tag.title.hasPrefix("Continuum.ControlItem.") || title?.hasPrefix("Continuum.ControlItem.") == true {
+            return true
+        }
+
+        return (title ?? tag.title).isEmpty
+    }
+
+    /// The application that owns the item.
+    ///
+    /// - Note: In macOS 26 and later, this property always returns the
+    ///   Control Center. To get the actual application that created the
+    ///   item, use ``sourceApplication``.
+    var owningApplication: NSRunningApplication? {
+        NSRunningApplication(processIdentifier: ownerPID)
+    }
+
+    /// The application that created the item.
+    ///
+    /// - Note: Prior to macOS 26, this property and ``owningApplication``
+    ///   are functionally equivalent.
+    var sourceApplication: NSRunningApplication? {
+        guard let sourcePID else {
+            return nil
+        }
+        return NSRunningApplication(processIdentifier: sourcePID)
+    }
+
+    /// The auto-detected name for the item (ignores custom name).
+    var autoDetectedName: String {
+        /// Converts "UpperCamelCase" to "Title Case".
+        ///
+        /// Ignores cases where a single lowercase letter immediately
+        /// precedes an uppercase letter (i.e. "WiFi").
+        func toTitleCase(_ s: some StringProtocol) -> String {
+            String(s).replacing(/([a-z]{2})([A-Z])/) { $0.output.1 + " " + $0.output.2 }
+        }
+
+        guard !isControlItem else {
+            return Constants.displayName
+        }
+
+        lazy var fallbackName = "Menu Bar Item"
+
+        guard let sourceApplication else {
+            return fallbackName
+        }
+
+        lazy var sourceName = sourceApplication.localizedName ?? sourceApplication.bundleIdentifier
+
+        guard let title else {
+            return sourceName ?? fallbackName
+        }
+
+        lazy var bestName = sourceName ?? title
+
+        guard !isBentoBox else {
+            if tag == .controlCenter {
+                return bestName
+            }
+            return title
+        }
+
+        let displayName = switch tag.namespace {
+        case .passwords, .weather, .textInputMenuAgent:
+            toTitleCase(bestName.replacing(/Menu.*/, with: ""))
+        case .controlCenter:
+            if let match = title.prefixMatch(of: /Hearing/) {
+                toTitleCase(match.output)
+            } else {
+                toTitleCase(title)
+            }
+        case .systemUIServer:
+            if let match = title.firstMatch(of: /TimeMachine/) {
+                toTitleCase(match.output)
+            } else {
+                toTitleCase(title)
+            }
+        default:
+            bestName
+        }
+
+        if UUID(uuidString: displayName) != nil, let sourceName {
+            return "\(sourceName) (\(displayName))"
+        }
+
+        return displayName
+    }
+
+    /// A name associated with the item, suited for display.
+    var displayName: String {
+        // Custom name takes precedence over auto-detected name
+        if let custom = customName, !custom.trimmingCharacters(in: .whitespaces).isEmpty {
+            return custom
+        }
+
+        return autoDetectedName
+    }
+
+    /// A textual representation of the item.
+    var description: String {
+        "\(displayName) (\(tag))"
+    }
+
+    /// A unique identifier for storing custom names.
+    ///
+    /// Uses `namespace:title:index` only — windowID is intentionally
+    /// excluded because it is transient and changes between app restarts,
+    /// which would cause persisted custom names to be lost.
+    var uniqueIdentifier: String {
+        if tag.instanceIndex > 0 {
+            return "\(tag.namespace):\(tag.title):\(tag.instanceIndex)"
+        }
+        return "\(tag.namespace):\(tag.title)"
+    }
+
+    /// Custom name for this item (persisted).
+    var customName: String? {
+        get {
+            let names = Defaults.dictionary(forKey: .menuBarItemCustomNames) as? [String: String] ?? [:]
+            return names[uniqueIdentifier]
+        }
+        set {
+            var names = Defaults.dictionary(forKey: .menuBarItemCustomNames) as? [String: String] ?? [:]
+            if let newValue, !newValue.trimmingCharacters(in: .whitespaces).isEmpty {
+                names[uniqueIdentifier] = newValue
+            } else {
+                names.removeValue(forKey: uniqueIdentifier)
+            }
+            Defaults.set(names, forKey: .menuBarItemCustomNames)
+        }
+    }
+
+    /// A string to use for logging purposes.
+    var logString: String {
+        "<\(tag) (windowID: \(windowID))>"
+    }
+
+    /// Creates a menu bar item without checks.
+    ///
+    /// This initializer does not perform validity checks on its parameters.
+    /// Only call it if you are certain the window is a valid menu bar item.
+    @MainActor
+    private init(uncheckedItemWindow itemWindow: WindowInfo, instanceIndex: Int = 0) {
+        self.tag = MenuBarItemTag(uncheckedItemWindow: itemWindow, instanceIndex: instanceIndex)
+        self.windowID = itemWindow.windowID
+        self.ownerPID = itemWindow.ownerPID
+        self.sourcePID = itemWindow.ownerPID
+        self.bounds = itemWindow.bounds
+        self.title = itemWindow.title
+        self.isOnScreen = itemWindow.isOnScreen
+    }
+
+    /// Creates a menu bar item without checks.
+    ///
+    /// This initializer does not perform validity checks on its parameters.
+    /// Only call it if you are certain the window is a valid menu bar item
+    /// and the source pid belongs to the application that created it.
+    @MainActor
+    private init(uncheckedItemWindow itemWindow: WindowInfo, sourcePID: pid_t?, instanceIndex: Int = 0) {
+        self.tag = MenuBarItemTag(uncheckedItemWindow: itemWindow, sourcePID: sourcePID, instanceIndex: instanceIndex)
+        self.windowID = itemWindow.windowID
+        self.ownerPID = itemWindow.ownerPID
+        self.sourcePID = sourcePID
+        self.bounds = itemWindow.bounds
+        self.title = itemWindow.title
+        self.isOnScreen = itemWindow.isOnScreen
+    }
+}
+
+// MARK: - MenuBarItem List
+
+extension MenuBarItem {
+    /// Options that specify the menu bar items in a list.
+    struct ListOption: OptionSet {
+        let rawValue: Int
+
+        /// Specifies menu bar items that are currently on screen.
+        static let onScreen = ListOption(rawValue: 1 << 0)
+
+        /// Specifies menu bar items on the currently active space.
+        static let activeSpace = ListOption(rawValue: 1 << 1)
+    }
+
+    /// Creates and returns a list of menu bar items windows for the given display.
+    ///
+    /// - Parameters:
+    ///   - display: An identifier for a display. Pass `nil` to return the menu bar
+    ///     item windows across all available displays.
+    ///   - option: Options that filter the returned list. Pass an empty option set
+    ///     to return all available menu bar item windows.
+    private static let diagLog = DiagLog(category: "MenuBarItem")
+
+    static func getMenuBarItemWindows(on display: CGDirectDisplayID? = nil, option: ListOption) -> [WindowInfo] {
+        var bridgingOption: Bridging.MenuBarWindowListOption = .itemsOnly
+
+        if option.contains(.onScreen) {
+            bridgingOption.insert(.onScreen)
+        }
+        if option.contains(.activeSpace) {
+            bridgingOption.insert(.activeSpace)
+        }
+
+        let rawWindowIDs = Bridging.getMenuBarWindowList(option: bridgingOption)
+        diagLog.debug("getMenuBarItemWindows: Bridging returned \(rawWindowIDs.count) window IDs (display=\(display.map { "\($0)" } ?? "nil"))")
+
+        let displayBounds = display.map { CGDisplayBounds($0) }
+
+        let windows = WindowInfo.createWindows(from: rawWindowIDs.reversed()).compactMap { window -> WindowInfo? in
+            if let displayBounds {
+                // Hidden items are pushed far off-screen horizontally, but they maintain
+                // their vertical (Y) coordinate. Filter by the display's Y range.
+                let midY = window.bounds.midY
+                guard midY >= displayBounds.minY, midY <= displayBounds.maxY else {
+                    return nil
+                }
+            }
+
+            return window
+        }
+
+        diagLog.debug("getMenuBarItemWindows: returning \(windows.count) windows from \(rawWindowIDs.count) raw IDs")
+        return windows
+    }
+
+    /// Creates and returns a list of menu bar items for the given display.
+    ///
+    /// - Parameters:
+    ///   - display: An identifier for a display. Pass `nil` to return the menu bar
+    ///     items across all available displays.
+    ///   - option: Options that filter the returned list. Pass an empty option set
+    ///     to return all available menu bar items.
+    @MainActor
+    private static func assignStableInstanceIndices(
+        to items: inout [MenuBarItem],
+        using windows: [WindowInfo]
+    ) {
+        // Final pass: assign instance indices to allow individual identification
+        // of items with the same (namespace, title). Sort by windowID within each
+        // group so that indices are stable regardless of item position changes
+        // (e.g. dragging between sections). This prevents image cache collisions
+        // caused by instanceIndex values swapping between cache cycles.
+        var groups = [String: [Int]]()
+        for i in 0 ..< items.count {
+            let key = "\(items[i].tag.namespace):\(items[i].tag.title)"
+            groups[key, default: []].append(i)
+        }
+        for (_, indices) in groups where indices.count > 1 {
+            let sorted = indices.sorted { items[$0].windowID < items[$1].windowID }
+            for (instanceIndex, itemIndex) in sorted.enumerated() where instanceIndex > 0 {
+                if let sourcePID = items[itemIndex].sourcePID {
+                    items[itemIndex] = MenuBarItem(
+                        uncheckedItemWindow: windows[itemIndex],
+                        sourcePID: sourcePID,
+                        instanceIndex: instanceIndex
+                    )
+                } else {
+                    items[itemIndex] = MenuBarItem(
+                        uncheckedItemWindow: windows[itemIndex],
+                        sourcePID: nil,
+                        instanceIndex: instanceIndex
+                    )
+                }
+            }
+        }
+    }
+
+    @available(macOS 26.0, *)
+    @MainActor
+    private static func makeItemsWithoutResolvingSourcePID(
+        from windows: [WindowInfo]
+    ) -> [MenuBarItem] {
+        var items = windows.map { window in
+            if let title = window.title, title.hasPrefix("Continuum.ControlItem.") {
+                let ccBundleID = "com.apple.controlcenter"
+                if window.owningApplication?.bundleIdentifier == ccBundleID ||
+                    window.ownerPID == ProcessInfo.processInfo.processIdentifier
+                {
+                    return MenuBarItem(
+                        uncheckedItemWindow: window,
+                        sourcePID: ProcessInfo.processInfo.processIdentifier
+                    )
+                }
+            }
+
+            return MenuBarItem(uncheckedItemWindow: window, sourcePID: nil)
+        }
+
+        assignStableInstanceIndices(to: &items, using: windows)
+        let nilPIDCount = items.count(where: { $0.sourcePID == nil })
+        diagLog.debug(
+            "getMenuBarItemsExperimental: created \(items.count) items without sourcePID resolution, \(nilPIDCount) unresolved"
+        )
+        return items
+    }
+
+    private static func normalizeSourcePIDs(
+        _ pids: [pid_t?],
+        expectedCount: Int,
+        source: String
+    ) -> [pid_t?] {
+        guard pids.count != expectedCount else {
+            return pids
+        }
+
+        diagLog.error(
+            "getMenuBarItems: \(source) returned \(pids.count) sourcePIDs for \(expectedCount) windows"
+        )
+
+        if pids.count > expectedCount {
+            return Array(pids.prefix(expectedCount))
+        }
+
+        return pids + Array(repeating: nil, count: expectedCount - pids.count)
+    }
+
+    static func sourcePIDsResolvingInProcess(for windows: [WindowInfo]) async -> [pid_t?] {
+        await Task.detached(priority: .userInitiated) {
+            SourcePIDCache.shared.pids(for: windows)
+        }.value
+    }
+
+    @available(macOS 26.0, *)
+    @MainActor
+    private static func getMenuBarItemsExperimental(
+        on display: CGDirectDisplayID?,
+        option: ListOption,
+        resolveSourcePID: Bool
+    ) async -> [MenuBarItem] {
+        let windows = getMenuBarItemWindows(on: display, option: option)
+        diagLog.debug("getMenuBarItems: processing \(windows.count) windows for source PID resolution")
+
+        guard resolveSourcePID else {
+            return makeItemsWithoutResolvingSourcePID(from: windows)
+        }
+
+        // Resolve all PIDs in one background batch, avoiding main-actor AX work.
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let ccBundleID = "com.apple.controlcenter"
+
+        let controlItemIndices = Set(windows.indices.filter { i in
+            guard let title = windows[i].title, title.hasPrefix("Continuum.ControlItem.") else {
+                return false
+            }
+            return windows[i].owningApplication?.bundleIdentifier == ccBundleID ||
+                windows[i].ownerPID == ownPID
+        })
+
+        let pids = await sourcePIDsResolvingInProcess(for: windows)
+        let resolvedCount = pids.compactMap(\.self).count
+        diagLog.debug(
+            "getMenuBarItems: in-process source PID resolver resolved \(resolvedCount)/\(windows.count) identities"
+        )
+        let normalizedPIDs = normalizeSourcePIDs(
+            pids,
+            expectedCount: windows.count,
+            source: "in-process source PID resolver"
+        )
+
+        var items = windows.enumerated().map { index, window in
+            let pid: pid_t? = controlItemIndices.contains(index) ? ownPID : normalizedPIDs[index]
+            return MenuBarItem(uncheckedItemWindow: window, sourcePID: pid)
+        }
+
+        // Post-resolution pass: fix up items with nil sourcePID.
+        //
+        // The SourcePIDCache resolves PIDs by spatially matching CG window
+        // bounds to AX extras menu bar children. When an app registers
+        // multiple NSStatusItems (e.g. OneDrive for personal and work
+        // accounts), the concurrent resolution may fail for one of the
+        // windows due to timing skew between CG and AX coordinate updates.
+        //
+        // Only propagate a resolved PID to unresolved items sharing
+        // the same title when it is safe to do so. We require that
+        // the resolved PID already accounts for at least 2 items
+        // (across any title), proving the app is a multi-item app.
+        // Without this guard, a single-item app's PID could be
+        // incorrectly assigned to an unresolved item from a
+        // *different* app that happens to share the same title
+        // (e.g. two apps both using "Item-0").
+        let unresolvedIndices = items.indices.filter { items[$0].sourcePID == nil && !items[$0].isControlItem }
+        if !unresolvedIndices.isEmpty {
+            // Count how many items each PID has been resolved to.
+            var resolvedCountByPID = [pid_t: Int]()
+            for item in items where item.sourcePID != nil {
+                if let pid = item.sourcePID {
+                    resolvedCountByPID[pid, default: 0] += 1
+                }
+            }
+
+            // Build a lookup from window title to resolved sourcePID.
+            // .resolved(pid) means exactly one PID maps to this title;
+            // .ambiguous means multiple different PIDs share the title
+            // (e.g. two apps both using "Item-0") and propagation is unsafe.
+            var titleToPID = [String: ResolvedPID]()
+            for item in items where item.sourcePID != nil {
+                if let title = item.title, let pid = item.sourcePID {
+                    if let existing = titleToPID[title] {
+                        // Mark as ambiguous if different PIDs share this title.
+                        if case let .resolved(existingPID) = existing, existingPID != pid {
+                            titleToPID[title] = .ambiguous
+                        }
+                    } else {
+                        titleToPID[title] = .resolved(pid)
+                    }
+                }
+            }
+
+            for idx in unresolvedIndices {
+                let item = items[idx]
+                if let title = item.title,
+                   case let .resolved(siblingPID) = titleToPID[title]
+                {
+                    // Only propagate if the resolved PID is already known
+                    // to own multiple items, confirming it is a multi-item
+                    // app where one window simply failed spatial matching.
+                    let resolvedCount = resolvedCountByPID[siblingPID, default: 0]
+                    guard resolvedCount >= 2 else {
+                        diagLog.debug("getMenuBarItems: skipping propagation of sourcePID \(siblingPID) to windowID \(item.windowID) (title=\(title)) — PID has only \(resolvedCount) resolved item(s)")
+                        continue
+                    }
+                    diagLog.debug("getMenuBarItems: propagating sourcePID \(siblingPID) to unresolved windowID \(item.windowID) (title=\(title))")
+                    items[idx] = MenuBarItem(uncheckedItemWindow: windows[idx], sourcePID: siblingPID)
+                }
+            }
+        }
+
+        assignStableInstanceIndices(to: &items, using: windows)
+
+        let nilPIDItems = items.filter { $0.sourcePID == nil }
+        if !nilPIDItems.isEmpty {
+            let itemsDesc = nilPIDItems.prefix(3).map(\.logString).joined(separator: ", ")
+            let moreDesc = nilPIDItems.count > 3 ? " and \(nilPIDItems.count - 3) more" : ""
+            diagLog.debug("getMenuBarItems: created \(items.count) items, \(nilPIDItems.count) with nil sourcePID: \(itemsDesc)\(moreDesc)")
+        } else {
+            diagLog.debug("getMenuBarItems: created \(items.count) items, all with resolved sourcePID")
+        }
+        return items
+    }
+
+    /// Creates and returns a list of menu bar items for the given display.
+    ///
+    /// - Parameters:
+    ///   - display: An identifier for a display. Pass `nil` to return the menu bar
+    ///     items across all available displays.
+    ///   - option: Options that filter the returned list. Pass an empty option set
+    ///     to return all available menu bar items.
+    @MainActor
+    static func getMenuBarItems(
+        on display: CGDirectDisplayID? = nil,
+        option: ListOption,
+        resolveSourcePID: Bool = true
+    ) async -> [MenuBarItem] {
+        diagLog.debug(
+            "getMenuBarItems: starting (resolveSourcePID=\(resolveSourcePID))"
+        )
+        let items = await getMenuBarItemsExperimental(
+            on: display,
+            option: option,
+            resolveSourcePID: resolveSourcePID
+        )
+        diagLog.debug("getMenuBarItems: returned \(items.count) items")
+        return items
+    }
+}
+
+// MARK: - MenuBarItem Init
+
+extension MenuBarItem {
+    init(tag: MenuBarItemTag, windowID: CGWindowID, ownerPID: pid_t, sourcePID: pid_t?, bounds: CGRect, title: String?, isOnScreen: Bool) {
+        self.tag = tag
+        self.windowID = windowID
+        self.ownerPID = ownerPID
+        self.sourcePID = sourcePID
+        self.bounds = bounds
+        self.title = title
+        self.isOnScreen = isOnScreen
+    }
+}
+
+// MARK: MenuBarItem: Equatable
+
+extension MenuBarItem: Equatable {
+    static func == (lhs: MenuBarItem, rhs: MenuBarItem) -> Bool {
+        lhs.tag == rhs.tag &&
+            lhs.windowID == rhs.windowID &&
+            lhs.ownerPID == rhs.ownerPID &&
+            lhs.sourcePID == rhs.sourcePID &&
+            lhs.bounds == rhs.bounds &&
+            lhs.title == rhs.title &&
+            lhs.isOnScreen == rhs.isOnScreen
+    }
+}
+
+// MARK: MenuBarItem: Hashable
+
+extension MenuBarItem: Hashable {
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(tag)
+        hasher.combine(windowID)
+        hasher.combine(ownerPID)
+        hasher.combine(sourcePID)
+        hasher.combine(bounds.origin.x)
+        hasher.combine(bounds.origin.y)
+        hasher.combine(bounds.size.width)
+        hasher.combine(bounds.size.height)
+        hasher.combine(title)
+        hasher.combine(isOnScreen)
+    }
+}
+
+// MARK: - MenuBarItemTag Helper
+
+private extension MenuBarItemTag {
+    /// Creates a tag without checks.
+    ///
+    /// This initializer does not perform validity checks on its parameters.
+    /// Only call it if you are certain the window is a valid menu bar item.
+    @MainActor
+    init(uncheckedItemWindow itemWindow: WindowInfo, instanceIndex: Int = 0) {
+        self.namespace = Namespace(uncheckedItemWindow: itemWindow)
+        self.title = itemWindow.title ?? ""
+        self.windowID = itemWindow.windowID
+        self.instanceIndex = instanceIndex
+    }
+
+    /// Creates a tag without checks.
+    ///
+    /// This initializer does not perform validity checks on its parameters.
+    /// Only call it if you are certain the window is a valid menu bar item
+    /// and the source pid belongs to the application that created it.
+    @MainActor
+    init(uncheckedItemWindow itemWindow: WindowInfo, sourcePID: pid_t?, instanceIndex: Int = 0) {
+        self.namespace = Namespace(uncheckedItemWindow: itemWindow, sourcePID: sourcePID)
+        self.title = itemWindow.title ?? ""
+        self.windowID = itemWindow.windowID
+        self.instanceIndex = instanceIndex
+    }
+}
+
+// MARK: - MenuBarItemTag.Namespace Helper
+
+extension MenuBarItemTag.Namespace {
+    private static let uuidCache = OSAllocatedUnfairLock<[CGWindowID: UUID]>(initialState: [:])
+
+    @MainActor
+    static func pruneUUIDCache(keeping validWindowIDs: Set<CGWindowID>) {
+        uuidCache.withLock { $0 = $0.filter { validWindowIDs.contains($0.key) } }
+    }
+
+    /// Creates a namespace without checks.
+    ///
+    /// This initializer does not perform validity checks on its parameters.
+    /// Only call it if you are certain the window is a valid menu bar item.
+    @MainActor
+    init(uncheckedItemWindow itemWindow: WindowInfo) {
+        // Most apps have a bundle ID, but we should be able to handle apps
+        // that don't. We should also be able to handle daemons and helpers,
+        // which are more likely not to have a bundle ID.
+        //
+        // Use the name of the owning process as a fallback. The non-localized
+        // name seems less likely to change, so let's prefer it as a (somewhat)
+        // stable identifier.
+        if let app = itemWindow.owningApplication {
+            self = .optional(app.bundleIdentifier ?? itemWindow.ownerName ?? app.localizedName)
+        } else {
+            self = .optional(itemWindow.ownerName)
+        }
+    }
+
+    /// Creates a namespace without checks.
+    ///
+    /// This initializer does not perform validity checks on its parameters.
+    /// Only call it if you are certain the window is a valid menu bar item
+    /// and the source pid belongs to the application that created it.
+    @MainActor
+    init(uncheckedItemWindow itemWindow: WindowInfo, sourcePID: pid_t?) {
+        // Check for our own control items by title and owner.
+        // On macOS 26, these are owned by Control Center.
+        if let title = itemWindow.title, title.hasPrefix("Continuum.ControlItem.") {
+            let ccBundleID = "com.apple.controlcenter"
+            if itemWindow.owningApplication?.bundleIdentifier == ccBundleID ||
+                itemWindow.ownerPID == ProcessInfo.processInfo.processIdentifier
+            {
+                self = .continuum
+                return
+            }
+        }
+
+        // Most apps have a bundle ID, but we should be able to handle apps
+        // that don't. We should also be able to handle daemons and helpers,
+        // which are more likely not to have a bundle ID.
+        if let sourcePID, let app = NSRunningApplication(processIdentifier: sourcePID) {
+            self = .optional(app.bundleIdentifier ?? app.localizedName)
+        } else if let app = itemWindow.owningApplication {
+            // Fallback: use the owning application's bundle ID or name.
+            // This covers cases where the source PID doesn't resolve
+            // (e.g. helper processes) but the owner is known.
+            self = .optional(app.bundleIdentifier ?? itemWindow.ownerName ?? app.localizedName)
+        } else if let ownerName = itemWindow.ownerName {
+            // Last resort: use the process name as a stable identifier.
+            self = .string(ownerName)
+        } else if let uuid = Self.uuidCache.withLock({ $0[itemWindow.windowID] }) {
+            self = .uuid(uuid)
+        } else {
+            let uuid = UUID()
+            Self.uuidCache.withLock { $0[itemWindow.windowID] = uuid }
+            self = .uuid(uuid)
+        }
+    }
+}
+
+/// Maps a window title to a resolved PID for the PID-propagation pass.
+private enum ResolvedPID {
+    /// Exactly one PID maps to this title; propagation is safe.
+    case resolved(pid_t)
+    /// Multiple different PIDs share this title; propagation is unsafe.
+    case ambiguous
+}
