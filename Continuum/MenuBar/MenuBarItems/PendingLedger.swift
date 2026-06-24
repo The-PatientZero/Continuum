@@ -35,8 +35,6 @@ enum PendingLedger {
     static let waitForRelaunchPrefix = "waitForRelaunch:"
 
     static let notFoundAttemptLimit = 10
-    static let immediateRehideAttemptLimit = 3
-    static let totalRehideAttemptLimit = 9
 
     /// A pending-relocation entry, parsed into a typed shape so the
     /// planner does not have to handle raw string sentinel formats.
@@ -282,14 +280,8 @@ enum PendingLedger {
 
     /// Decides what to do after a move attempt failed while rehiding a
     /// temporarily shown item.
-    static nonisolated func rehideFailureDecision(after attempts: Int) -> RehideFailureDecision {
-        if attempts < immediateRehideAttemptLimit {
-            return .retryImmediately
-        }
-        if attempts < totalRehideAttemptLimit {
-            return .retryLater
-        }
-        return .waitForRelaunch
+    static nonisolated func rehideFailureDecision(after _: Int) -> RehideFailureDecision {
+        .waitForRelaunch
     }
 
     /// Computes the next pending-relocation decision for a single entry.

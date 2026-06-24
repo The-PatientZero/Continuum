@@ -44,7 +44,8 @@ struct MenuBarItemTag: Hashable, CustomStringConvertible {
             // Control Center hosts many items, so its immovable entries
             // (Clock, the Control Center pill) must match by exact title or
             // they would wrongly lock movable modules like Wi-Fi. Dedicated
-            // single-item system agents (e.g. Screen Sharing's SSMenuAgent)
+            // single-item system agents (e.g. TextInputMenuAgent, Screen
+            // Sharing's SSMenuAgent)
             // own one window whose title the Window Server reports
             // inconsistently — sometimes "Item-0", often empty — so they are
             // matched by namespace alone. Without this, the empty-title live
@@ -175,8 +176,9 @@ extension MenuBarItemTag {
     /// These items have fixed positions at the trailing end of the menu bar,
     /// and cannot be hidden.
     ///
-    /// This list contains the "Clock", "Control Center", and "Screen Sharing" (ssMenuAgent) items.
-    static let immovableItems: [MenuBarItemTag] = [clock, controlCenter, ssMenuAgent]
+    /// This list contains the "Clock", "Control Center", input menu, and
+    /// Screen Sharing (ssMenuAgent) items.
+    static let immovableItems: [MenuBarItemTag] = [clock, controlCenter, textInputMenuAgent, ssMenuAgent]
 
     /// An array of tags for items that can be moved, but cannot be hidden.
     static let nonHideableItems: [MenuBarItemTag] = [visibleControlItem, audioVideoModule, faceTime, screenCaptureUI, gameMode]
@@ -226,6 +228,13 @@ extension MenuBarItemTag {
     /// The item visually follows the cursor during the drag, but springs
     /// back to its original position on mouse-up.
     static let ssMenuAgent = MenuBarItemTag(namespace: .ssMenuAgent, title: "Item-0")
+
+    /// The tag for the system TextInputMenuAgent item (input menu).
+    ///
+    /// macOS may expose this agent in the menu bar window list, but moving it
+    /// with synthetic Command-drag events times out and leaves temporary-reveal
+    /// rehide state stuck.
+    static let textInputMenuAgent = MenuBarItemTag(namespace: .textInputMenuAgent, title: "Item-0")
 
     /// The tag for the system "Time Machine" item.
     static let timeMachine = MenuBarItemTag(namespace: .systemUIServer, title: "com.apple.menuextra.TimeMachine")

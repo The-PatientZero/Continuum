@@ -13,12 +13,16 @@ struct MenuBarLayoutEditorItem: Identifiable, Hashable {
     let id: String
     let title: String
     let subtitle: String
-    let systemSymbolName: String?
+    let systemIcon: MenuBarSystemMenuExtraIcon?
     let iconBundleIdentifier: String?
     let iconProcessIdentifier: pid_t?
     let isAvailable: Bool
     let isMovable: Bool
     let isIdentityResolved: Bool
+
+    var systemSymbolName: String? {
+        systemIcon?.systemSymbolName
+    }
 }
 
 /// A staged, display-ready view of the user's saved/current layout.
@@ -120,7 +124,7 @@ enum MenuBarLayoutEditorPolicy {
                 id: identifier,
                 title: title(for: currentItem),
                 subtitle: subtitle(for: currentItem),
-                systemSymbolName: MenuBarSystemMenuExtraMetadata.symbolName(for: currentItem),
+                systemIcon: MenuBarSystemMenuExtraMetadata.icon(for: currentItem),
                 iconBundleIdentifier: iconBundleIdentifier(
                     for: identifier,
                     currentItem: currentItem
@@ -137,7 +141,7 @@ enum MenuBarLayoutEditorPolicy {
             id: identifier,
             title: displayName(forSavedIdentifier: identifier),
             subtitle: "Saved item",
-            systemSymbolName: MenuBarSystemMenuExtraMetadata.symbolName(forSavedIdentifier: identifier),
+            systemIcon: MenuBarSystemMenuExtraMetadata.icon(forSavedIdentifier: identifier),
             iconBundleIdentifier: bundleIdentifier(forSavedIdentifier: identifier),
             iconProcessIdentifier: nil,
             isAvailable: false,

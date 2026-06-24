@@ -455,10 +455,13 @@ struct LayoutSettingsPane: View {
         ZStack {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(sectionAccent(section).opacity(item.isAvailable ? 0.14 : 0.07))
-            if let systemSymbolName = item.systemSymbolName {
-                Image(systemName: systemSymbolName)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(sectionAccent(section))
+            if let systemIcon = item.systemIcon {
+                SystemMenuExtraIconView(
+                    icon: systemIcon,
+                    color: sectionAccent(section),
+                    size: 20,
+                    symbolPointSize: 14
+                )
             } else if item.isIdentityResolved {
                 if let image = iconImage(for: item) {
                     Image(nsImage: image)
@@ -762,5 +765,27 @@ struct LayoutSettingsPane: View {
         }
 
         return nil
+    }
+}
+
+private struct SystemMenuExtraIconView: View {
+    let icon: MenuBarSystemMenuExtraIcon
+    let color: Color
+    let size: CGFloat
+    let symbolPointSize: CGFloat
+
+    var body: some View {
+        if let image = icon.nsImage {
+            Image(nsImage: image)
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: size, height: size)
+                .foregroundStyle(color)
+        } else if let systemSymbolName = icon.systemSymbolName {
+            Image(systemName: systemSymbolName)
+                .font(.system(size: symbolPointSize, weight: .semibold))
+                .foregroundStyle(color)
+        }
     }
 }

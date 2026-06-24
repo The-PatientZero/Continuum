@@ -57,6 +57,9 @@ struct MenuBarSavedLayoutCursorSession: Equatable {
             return nil
         }
         let cgY = screen.origin.y + screen.height - savedPosition.y
-        return CGPoint(x: savedPosition.x, y: cgY)
+        return MenuBarMoveGeometryPolicy.hotCornerSafePoint(
+            CGPoint(x: savedPosition.x, y: cgY),
+            screenFrames: screenFrames
+        )
     }
 }

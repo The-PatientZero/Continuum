@@ -957,11 +957,122 @@ final class MenuBarRuntimeTests: XCTestCase {
             ),
             "rectangle.on.rectangle"
         )
+        XCTAssertEqual(
+            MenuBarSystemMenuExtraMetadata.icon(
+                namespace: "com.apple.controlcenter",
+                title: "BentoBox-0"
+            )?.systemSymbolName,
+            "switch.2"
+        )
+        XCTAssertEqual(
+            MenuBarSystemMenuExtraMetadata.icon(
+                namespace: "com.apple.controlcenter",
+                title: "WiFi"
+            )?.source,
+            .bundleImage(
+                bundlePath: "/System/Library/CoreServices/ControlCenter.app",
+                resourceName: "wifi.menu.network"
+            )
+        )
+        XCTAssertEqual(
+            MenuBarSystemMenuExtraMetadata.icon(
+                namespace: "com.apple.controlcenter",
+                title: "WiFi"
+            )?.systemSymbolName,
+            "wifi"
+        )
+        XCTAssertEqual(
+            MenuBarSystemMenuExtraMetadata.icon(
+                namespace: "com.apple.controlcenter",
+                title: "Bluetooth"
+            )?.source,
+            .appKitImage("NSBluetoothTemplate")
+        )
+        XCTAssertNotNil(
+            MenuBarSystemMenuExtraMetadata.icon(
+                namespace: "com.apple.controlcenter",
+                title: "Battery"
+            )?.nsImage
+        )
         XCTAssertNil(
             MenuBarSystemMenuExtraMetadata.displayName(
                 namespace: "com.apple.controlcenter",
                 title: "Item-0"
             )
+        )
+    }
+
+    func testOverlayTrayClickGestureRequiresMatchingMouseDown() {
+        let bounds = CGRect(x: 0, y: 0, width: 24, height: 24)
+
+        XCTAssertFalse(
+            OverlayTrayClickGesturePolicy.shouldActivate(
+                mouseDownDate: nil,
+                mouseDownLocation: nil,
+                mouseUpDate: Date(timeIntervalSinceReferenceDate: 1),
+                mouseUpLocation: CGPoint(x: 12, y: 12),
+                bounds: bounds
+            )
+        )
+    }
+
+    func testOverlayTrayClickGestureRejectsMouseUpOutsideItemBounds() {
+        let downDate = Date(timeIntervalSinceReferenceDate: 1)
+        let bounds = CGRect(x: 0, y: 0, width: 24, height: 24)
+
+        XCTAssertFalse(
+            OverlayTrayClickGesturePolicy.shouldActivate(
+                mouseDownDate: downDate,
+                mouseDownLocation: CGPoint(x: 12, y: 12),
+                mouseUpDate: downDate.addingTimeInterval(0.1),
+                mouseUpLocation: CGPoint(x: 42, y: 12),
+                bounds: bounds
+            )
+        )
+    }
+
+    func testOverlayTrayClickGestureAcceptsStationaryClickInsideItemBounds() {
+        let downDate = Date(timeIntervalSinceReferenceDate: 1)
+        let bounds = CGRect(x: 0, y: 0, width: 24, height: 24)
+
+        XCTAssertTrue(
+            OverlayTrayClickGesturePolicy.shouldActivate(
+                mouseDownDate: downDate,
+                mouseDownLocation: CGPoint(x: 12, y: 12),
+                mouseUpDate: downDate.addingTimeInterval(0.1),
+                mouseUpLocation: CGPoint(x: 13, y: 12),
+                bounds: bounds
+            )
+        )
+    }
+
+    func testOverlayTrayHotCornerParkingPolicyReturnsOnlyAdjustedPoints() {
+        let screens = [CGRect(x: 0, y: 0, width: 1_440, height: 900)]
+
+        XCTAssertEqual(
+            OverlayTrayHotCornerParkingPolicy.parkingPoint(
+                for: CGPoint(x: 4, y: 4),
+                screenFrames: screens
+            ),
+            CGPoint(x: 48, y: 48)
+        )
+        XCTAssertNil(
+            OverlayTrayHotCornerParkingPolicy.parkingPoint(
+                for: CGPoint(x: 200, y: 4),
+                screenFrames: screens
+            )
+        )
+    }
+
+    func testOverlayTrayHotCornerParkingPolicyHandlesTopLeftCorner() {
+        let screens = [CGRect(x: 0, y: 0, width: 1_440, height: 900)]
+
+        XCTAssertEqual(
+            OverlayTrayHotCornerParkingPolicy.parkingPoint(
+                for: CGPoint(x: 4, y: 896),
+                screenFrames: screens
+            ),
+            CGPoint(x: 48, y: 852)
         )
     }
 
@@ -1317,6 +1428,28 @@ final class MenuBarRuntimeTests: XCTestCase {
         XCTAssertEqual(snapshot.unresolvedItems.map(\.itemIdentifier), [unresolved.uniqueIdentifier])
     }
 
+    func testSnapshotExcludesStableImmovableSystemAgentsFromMovableItems() {
+        let inputMenu = MenuBarItem.fixture(
+            tag: MenuBarItemTag(namespace: .textInputMenuAgent, title: "", windowID: 91),
+            windowID: 91,
+            sourcePID: 1234,
+            isOnScreen: false
+        )
+        var cache = MenuBarItemCache(displayID: 42)
+        cache[.hidden] = [inputMenu]
+
+        let snapshot = MenuBarSnapshot(
+            cache: cache,
+            controlItemsMissing: false,
+            systemMenuBarHidden: false
+        )
+
+        let snapshotItem = snapshot.items.first { $0.itemIdentifier == inputMenu.uniqueIdentifier }
+        XCTAssertEqual(snapshotItem?.confidence, .stable)
+        XCTAssertFalse(snapshotItem?.allowsAutomatedMove ?? true)
+        XCTAssertTrue(snapshot.movableItems.isEmpty)
+    }
+
     func testRuntimeCommandPolicyAllowsVisibleActivationWhileControlsAreMissing() {
         let item = MenuBarItem.fixture(
             tag: .appItem(bundleID: "com.example.clock", title: "Clock"),
@@ -1436,6 +1569,62 @@ final class MenuBarRuntimeTests: XCTestCase {
                 itemIsOnScreen: false
             ),
             .reject(.invalidIdentity(.titleOnly))
+        )
+    }
+
+    func testRuntimeCommandPolicyRejectsHiddenActivationForImmovableSystemAgent() {
+        let item = MenuBarItem.fixture(
+            tag: MenuBarItemTag(namespace: .textInputMenuAgent, title: "", windowID: 92),
+            windowID: 92,
+            sourcePID: 1234,
+            isOnScreen: false
+        )
+        var cache = MenuBarItemCache(displayID: 42)
+        cache[.hidden] = [item]
+        let inventory = MenuBarRuntimeInventory(
+            state: .idle,
+            snapshot: MenuBarSnapshot(
+                cache: cache,
+                controlItemsMissing: false,
+                systemMenuBarHidden: false
+            )
+        )
+
+        XCTAssertEqual(
+            MenuBarRuntimeCommandPolicy.activationDecision(
+                itemIdentifier: item.uniqueIdentifier,
+                inventory: inventory,
+                itemIsOnScreen: false
+            ),
+            .reject(.automatedMoveUnavailable(.stable))
+        )
+    }
+
+    func testRuntimeCommandPolicyAllowsHiddenActivationForMovableItem() {
+        let item = MenuBarItem.fixture(
+            tag: .appItem(bundleID: "com.example.clock", title: "Clock"),
+            windowID: 93,
+            sourcePID: 1234,
+            isOnScreen: false
+        )
+        var cache = MenuBarItemCache(displayID: 42)
+        cache[.hidden] = [item]
+        let inventory = MenuBarRuntimeInventory(
+            state: .idle,
+            snapshot: MenuBarSnapshot(
+                cache: cache,
+                controlItemsMissing: false,
+                systemMenuBarHidden: false
+            )
+        )
+
+        XCTAssertEqual(
+            MenuBarRuntimeCommandPolicy.activationDecision(
+                itemIdentifier: item.uniqueIdentifier,
+                inventory: inventory,
+                itemIsOnScreen: false
+            ),
+            .allow(.temporarilyReveal)
         )
     }
 
@@ -2272,6 +2461,35 @@ final class MenuBarRuntimeTests: XCTestCase {
                 activeScreenNotchFrame: notchFrame
             ),
             original
+        )
+    }
+
+    func testMoveGeometryPolicyInsetsRestorationPointAwayFromHotCorners() {
+        let screenFrames = [
+            CGRect(x: 0, y: 0, width: 1_440, height: 900),
+            CGRect(x: 1_440, y: 0, width: 1_920, height: 1_080),
+        ]
+
+        XCTAssertEqual(
+            MenuBarMoveGeometryPolicy.hotCornerSafePoint(
+                CGPoint(x: 3, y: 4),
+                screenFrames: screenFrames
+            ),
+            CGPoint(x: 48, y: 48)
+        )
+        XCTAssertEqual(
+            MenuBarMoveGeometryPolicy.hotCornerSafePoint(
+                CGPoint(x: 3_355, y: 1_075),
+                screenFrames: screenFrames
+            ),
+            CGPoint(x: 3_312, y: 1_032)
+        )
+        XCTAssertEqual(
+            MenuBarMoveGeometryPolicy.hotCornerSafePoint(
+                CGPoint(x: 200, y: 4),
+                screenFrames: screenFrames
+            ),
+            CGPoint(x: 200, y: 4)
         )
     }
 
@@ -3479,18 +3697,67 @@ final class MenuBarRuntimeTests: XCTestCase {
             tag: .appItem(bundleID: "com.example.anchor", title: "Anchor"),
             windowID: 208
         )
+        let requestedItem = MenuBarItem.fixture(
+            tag: .appItem(bundleID: "com.example.requested", title: "Requested"),
+            windowID: 209
+        )
 
         XCTAssertEqual(
-            MenuBarTemporaryRevealPolicy.revealAnchor(in: [appItem, visibleControl]),
+            MenuBarTemporaryRevealPolicy.revealAnchor(
+                for: requestedItem,
+                in: [appItem, visibleControl]
+            ),
             visibleControl
         )
         XCTAssertEqual(
-            MenuBarTemporaryRevealPolicy.revealAnchor(in: [hiddenControl, appItem]),
+            MenuBarTemporaryRevealPolicy.revealAnchor(
+                for: requestedItem,
+                in: [hiddenControl, appItem]
+            ),
             appItem
         )
         XCTAssertEqual(
-            MenuBarTemporaryRevealPolicy.revealAnchor(in: [hiddenControl]),
+            MenuBarTemporaryRevealPolicy.revealAnchor(
+                for: requestedItem,
+                in: [hiddenControl]
+            ),
             hiddenControl
+        )
+    }
+
+    func testTemporaryRevealPolicyNeverUsesRequestedItemAsRevealAnchor() {
+        let requestedItem = MenuBarItem.fixture(
+            tag: .appItem(bundleID: "com.example.requested", title: "Requested"),
+            windowID: 209
+        )
+        let requestedItemWithFreshWindow = MenuBarItem.fixture(
+            tag: .appItem(bundleID: "com.example.requested", title: "Requested", windowID: 210),
+            windowID: 210
+        )
+        let otherItem = MenuBarItem.fixture(
+            tag: .appItem(bundleID: "com.example.other", title: "Other"),
+            windowID: 211
+        )
+
+        XCTAssertEqual(
+            MenuBarTemporaryRevealPolicy.revealAnchor(
+                for: requestedItem,
+                in: [requestedItem, otherItem]
+            ),
+            otherItem
+        )
+        XCTAssertEqual(
+            MenuBarTemporaryRevealPolicy.revealAnchor(
+                for: requestedItem,
+                in: [requestedItemWithFreshWindow, otherItem]
+            ),
+            otherItem
+        )
+        XCTAssertNil(
+            MenuBarTemporaryRevealPolicy.revealAnchor(
+                for: requestedItem,
+                in: [requestedItemWithFreshWindow]
+            )
         )
     }
 
@@ -3793,6 +4060,90 @@ final class MenuBarRuntimeTests: XCTestCase {
                 "window", "timer", "end",
             ]
         )
+    }
+
+    @MainActor
+    func testTemporaryRevealExecutorRevealsAndRightClicksWithSingleMoveAttempt() async {
+        let item = MenuBarItem.fixture(
+            tag: .appItem(bundleID: "com.example.reveal", title: "Reveal", windowID: 704),
+            windowID: 704,
+            sourcePID: 7_004
+        )
+        let returnNeighbor = MenuBarItem.fixture(
+            tag: .appItem(bundleID: "com.example.neighbor", title: "Neighbor", windowID: 705),
+            windowID: 705,
+            sourcePID: 7_005
+        )
+        let visibleControl = MenuBarItem.fixture(
+            tag: .visibleControlItem,
+            windowID: 706,
+            sourcePID: nil
+        )
+        let harness = TemporaryRevealExecutorHarness()
+        harness.observedItems = [item, returnNeighbor, visibleControl]
+
+        let outcome = await MenuBarTemporaryRevealExecutor.execute(
+            item: item,
+            mouseButton: .right,
+            resolvedDisplayID: 99,
+            originalSection: .alwaysHidden,
+            fastPath: true,
+            operations: harness.operations()
+        )
+
+        XCTAssertEqual(outcome.result, .movedAndClicked)
+        XCTAssertEqual(harness.moveDestinations, [.leftOfItem(visibleControl)])
+        XCTAssertEqual(harness.moveAttemptBudgets, [1])
+        XCTAssertEqual(harness.clickedItems, [item])
+        XCTAssertEqual(harness.clickedButtons, [.right])
+        XCTAssertEqual(harness.clickAttemptBudgets, [1])
+        XCTAssertEqual(harness.appendedContexts.map(\.tag), [item.tag])
+        XCTAssertEqual(harness.appendedContexts.first?.displayID, 99)
+        XCTAssertEqual(harness.recordedMetadataValues.first?.relocationValue, "alwaysHidden")
+        XCTAssertEqual(harness.recordedMetadataTags, [item.tag.tagIdentifier])
+        XCTAssertEqual(harness.persistCount, 1)
+        XCTAssertEqual(harness.scheduleCount, 1)
+        XCTAssertEqual(
+            harness.events,
+            [
+                "hasContexts", "hasContexts", "observe-99", "recordPending", "persist",
+                "begin", "origin", "move-1", "append", "cancel",
+                "refresh", "ids", "electron", "click-1", "sleep",
+                "window", "timer", "end",
+            ]
+        )
+    }
+
+    @MainActor
+    func testTemporaryRevealExecutorDoesNotForceRehideBeforeSecondaryActivation() async {
+        let item = MenuBarItem.fixture(
+            tag: .appItem(bundleID: "com.example.requested", title: "Requested", windowID: 707),
+            windowID: 707,
+            sourcePID: 7_007
+        )
+        let stuckTag = MenuBarItemTag.appItem(
+            bundleID: "com.example.stuck",
+            title: "Stuck",
+            windowID: 708
+        )
+        let harness = TemporaryRevealExecutorHarness()
+        harness.hasTemporaryContexts = true
+        harness.outstandingContexts = [.init(tag: stuckTag, rehideAttempts: 1)]
+
+        let outcome = await MenuBarTemporaryRevealExecutor.execute(
+            item: item,
+            mouseButton: .right,
+            resolvedDisplayID: 99,
+            originalSection: .hidden,
+            fastPath: true,
+            operations: harness.operations()
+        )
+
+        XCTAssertEqual(outcome.result, .showFailed)
+        XCTAssertEqual(harness.forceRehideCount, 0)
+        XCTAssertEqual(harness.scheduleCount, 1)
+        XCTAssertTrue(harness.moveDestinations.isEmpty)
+        XCTAssertEqual(harness.events, ["hasContexts", "outstanding", "timer"])
     }
 
     @MainActor
@@ -4447,15 +4798,7 @@ final class MenuBarRuntimeTests: XCTestCase {
                 windowID: 12345,
                 originalSection: .hidden
             ),
-            .retryImmediately
-        )
-        XCTAssertEqual(
-            MenuBarTemporaryRehidePolicy.moveFailureAction(
-                afterRehideAttempts: 3,
-                windowID: 12345,
-                originalSection: .hidden
-            ),
-            .retryLater
+            .waitForRelaunch(pendingRelocationValue: "waitForRelaunch:12345:hidden")
         )
         XCTAssertEqual(
             MenuBarTemporaryRehidePolicy.moveFailureAction(
@@ -4812,7 +5155,7 @@ final class MenuBarRuntimeTests: XCTestCase {
     }
 
     @MainActor
-    func testTemporaryRehideExecutorMarksWaitForRelaunchAfterRepeatedMoveFailures() async {
+    func testTemporaryRehideExecutorMarksWaitForRelaunchAfterFirstMoveFailure() async {
         struct TemporaryRehideTestError: Error {}
 
         let tag = MenuBarItemTag.appItem(
@@ -4832,7 +5175,6 @@ final class MenuBarRuntimeTests: XCTestCase {
             target: anchor,
             originalSection: .alwaysHidden
         )
-        context.rehideAttempts = 8
         var contexts = [context]
         var markedValue: String?
         var markedTagIdentifier: String?
@@ -4885,7 +5227,7 @@ final class MenuBarRuntimeTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(context.rehideAttempts, 9)
+        XCTAssertEqual(context.rehideAttempts, 1)
         XCTAssertEqual(markedValue, "waitForRelaunch:601:alwaysHidden")
         XCTAssertEqual(markedTagIdentifier, tag.tagIdentifier)
         XCTAssertEqual(persistCount, 2)
@@ -5811,6 +6153,16 @@ final class MenuBarRuntimeTests: XCTestCase {
         )
 
         XCTAssertEqual(point, CGPoint(x: 1_700, y: 800))
+    }
+
+    func testSavedLayoutCursorSessionInsetsHotCornerRestorationPoint() {
+        let point = MenuBarSavedLayoutCursorSession.restorationPoint(
+            for: CGPoint(x: 4, y: 896),
+            screenFrames: [CGRect(x: 0, y: 0, width: 1_440, height: 900)],
+            fallbackScreenFrame: nil
+        )
+
+        XCTAssertEqual(point, CGPoint(x: 48, y: 48))
     }
 
     func testSavedLayoutCursorSessionSkipsWarpWhenNoScreenIsAvailable() {
@@ -9979,6 +10331,7 @@ private extension MenuBarRuntimeTests {
         var accessibilityPressResult = false
         var clickErrors = [Error]()
         var clickedItems = [MenuBarItem]()
+        var clickedButtons = [CGMouseButton]()
         var clickAttemptBudgets = [Int]()
 
         func operations() -> MenuBarTemporaryRevealExecutor.Operations {
@@ -10080,9 +10433,10 @@ private extension MenuBarRuntimeTests {
                     self.events.append("pressAX")
                     return self.accessibilityPressResult
                 },
-                clickItem: { item, _, maxAttempts in
+                clickItem: { item, mouseButton, maxAttempts in
                     self.events.append("click-\(maxAttempts)")
                     self.clickedItems.append(item)
+                    self.clickedButtons.append(mouseButton)
                     self.clickAttemptBudgets.append(maxAttempts)
                     if !self.clickErrors.isEmpty {
                         throw self.clickErrors.removeFirst()

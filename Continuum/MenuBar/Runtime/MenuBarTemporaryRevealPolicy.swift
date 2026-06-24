@@ -107,10 +107,17 @@ enum MenuBarTemporaryRevealPolicy {
         return nil
     }
 
-    static func revealAnchor(in items: [MenuBarItem]) -> MenuBarItem? {
-        items.first(matching: .visibleControlItem) ??
-            items.first(where: { !$0.isControlItem && $0.canBeHidden }) ??
-            items.first
+    static func revealAnchor(
+        for item: MenuBarItem,
+        in items: [MenuBarItem]
+    ) -> MenuBarItem? {
+        let candidates = items.filter {
+            !$0.tag.matchesIgnoringWindowID(item.tag)
+        }
+
+        return candidates.first(matching: .visibleControlItem) ??
+            candidates.first(where: { !$0.isControlItem && $0.canBeHidden }) ??
+            candidates.first
     }
 
     static func resolveReturnDestination(

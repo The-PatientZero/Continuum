@@ -22,6 +22,7 @@ enum MenuBarRuntimeCommandPolicy {
         case itemNotFound(String)
         case liveItemUnavailable(String)
         case runtimeNotActionable(MenuBarRuntimeRecoveryAction)
+        case automatedMoveUnavailable(MenuBarIdentityConfidence)
         case invalidIdentity(MenuBarIdentityConfidence)
 
         var description: String {
@@ -32,6 +33,8 @@ enum MenuBarRuntimeCommandPolicy {
                 "liveItemUnavailable(\(identifier))"
             case let .runtimeNotActionable(action):
                 "runtimeNotActionable(recommendedRecovery=\(action))"
+            case let .automatedMoveUnavailable(confidence):
+                "automatedMoveUnavailable(\(confidence))"
             case let .invalidIdentity(confidence):
                 "invalidIdentity(\(confidence))"
             }
@@ -69,6 +72,9 @@ enum MenuBarRuntimeCommandPolicy {
             }
             guard allowsTemporaryReveal(item.confidence) else {
                 return .reject(.invalidIdentity(item.confidence))
+            }
+            guard item.allowsAutomatedMove else {
+                return .reject(.automatedMoveUnavailable(item.confidence))
             }
         }
 

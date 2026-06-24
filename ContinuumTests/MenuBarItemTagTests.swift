@@ -287,6 +287,15 @@ final class MenuBarItemTagTests: XCTestCase {
         XCTAssertFalse(cc.isMovable)
     }
 
+    func testTextInputMenuAgentIsNotMovable() {
+        let inputMenu = MenuBarItemTag(
+            namespace: .textInputMenuAgent,
+            title: ""
+        )
+
+        XCTAssertFalse(inputMenu.isMovable)
+    }
+
     func testRegularItemIsMovable() {
         let tag = MenuBarItemTag(
             namespace: .string("com.example.app"),

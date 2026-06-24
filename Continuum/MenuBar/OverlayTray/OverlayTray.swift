@@ -689,24 +689,19 @@ private struct OverlayTrayItemView: View {
             let clickStartTime = Date.now
             OverlayTrayItemView.diagLog.debug("leftClick: user clicked \(item.logString)")
             let panel = menuBarManager.overlayTrayPanel
+            parkCursorAwayFromHotCorners()
             menuBarManager.section(withName: section)?.hide()
             Task {
                 // Wait until the OverlayTray panel is fully closed before checking
                 // item visibility. Uses KVO on isVisible so we resume as soon
                 // as the panel hides rather than busy-polling.
                 await panel.waitUntilClosed(timeout: .milliseconds(200))
-                if let liveItem = await liveOnScreenItem(matching: item, on: displayID) {
-                    try await itemManager.click(item: liveItem, with: .left)
-                    let duration = Date.now.timeIntervalSince(clickStartTime)
-                    OverlayTrayItemView.diagLog.debug("leftClick: ✓ completed in \(Int(duration * 1000))ms (on-screen path)")
-                } else {
-                    // temporarilyShow handles move, click, and fallback click
-                    // internally so that shownInterfaceWindow is always captured
-                    // regardless of which click attempt succeeds.
-                    let result = await itemManager.temporarilyShow(item: item, clickingWith: .left, on: displayID, fastPath: true)
-                    let duration = Date.now.timeIntervalSince(clickStartTime)
-                    OverlayTrayItemView.diagLog.debug("leftClick: completed in \(Int(duration * 1000))ms (temp-show path, result=\(result))")
-                }
+                await activateTrayItem(
+                    with: .left,
+                    actionName: "leftClick",
+                    clickStartTime: clickStartTime,
+                    itemManager: itemManager
+                )
             }
         }
     }
@@ -716,33 +711,79 @@ private struct OverlayTrayItemView: View {
             guard let itemManager, let menuBarManager else {
                 return
             }
+            let clickStartTime = Date.now
+            OverlayTrayItemView.diagLog.debug("rightClick: user clicked \(item.logString)")
             let panel = menuBarManager.overlayTrayPanel
+            parkCursorAwayFromHotCorners()
             menuBarManager.section(withName: section)?.hide()
             Task {
                 await panel.waitUntilClosed(timeout: .milliseconds(200))
-                if let liveItem = await liveOnScreenItem(matching: item, on: displayID) {
-                    try await itemManager.click(item: liveItem, with: .right)
-                } else {
-                    let result = await itemManager.temporarilyShow(item: item, clickingWith: .right, on: displayID, fastPath: true)
-                    OverlayTrayItemView.diagLog.debug("rightClick: temp-show result=\(result)")
-                }
+                await activateTrayItem(
+                    with: .right,
+                    actionName: "rightClick",
+                    clickStartTime: clickStartTime,
+                    itemManager: itemManager
+                )
             }
         }
     }
 
-    /// Re-fetches on-screen items and returns the live `MenuBarItem` whose
-    /// tag+PID matches `item`, or `nil` if the item is not currently on-screen.
-    ///
-    /// Matching by tag+PID rather than the cached `windowID` guards against
-    /// CGWindowID recycling after a long system sleep, which would otherwise
-    /// cause `isWindowOnScreen` to return a false positive for an unrelated window.
-    private func liveOnScreenItem(matching item: MenuBarItem, on displayID: CGDirectDisplayID) async -> MenuBarItem? {
-        let liveItems = await MenuBarItem.getMenuBarItems(on: displayID, option: .onScreen)
-        guard let liveItem = liveItems.first(where: {
-            $0.tag.matchesIgnoringWindowID(item.tag) &&
-                ($0.sourcePID ?? $0.ownerPID) == (item.sourcePID ?? item.ownerPID)
-        }) else { return nil }
-        return Bridging.isWindowOnScreen(liveItem.windowID) ? liveItem : nil
+    private func parkCursorAwayFromHotCorners() {
+        guard
+            let location = MouseHelpers.locationCoreGraphics,
+            let parkingPoint = OverlayTrayHotCornerParkingPolicy.parkingPoint(
+                for: location,
+                screenFrames: NSScreen.screens.map { CGDisplayBounds($0.displayID) }
+            )
+        else {
+            return
+        }
+
+        OverlayTrayItemView.diagLog.debug(
+            """
+            Parking cursor away from hot corner before dismissing tray: \
+            from=(\(Int(location.x)),\(Int(location.y))) \
+            to=(\(Int(parkingPoint.x)),\(Int(parkingPoint.y)))
+            """
+        )
+        MouseHelpers.warpCursor(to: parkingPoint)
+    }
+
+    private func activateTrayItem(
+        with mouseButton: CGMouseButton,
+        actionName: String,
+        clickStartTime: Date,
+        itemManager: MenuBarItemManager
+    ) async {
+        let decision = await itemManager.activateItem(
+            withIdentifier: item.uniqueIdentifier,
+            on: displayID,
+            mouseButton: mouseButton,
+            fastPath: true
+        )
+        switch decision {
+        case let .allow(route):
+            logActivationCompletion(
+                actionName: actionName,
+                clickStartTime: clickStartTime,
+                path: "\(route)"
+            )
+        case let .reject(reason):
+            OverlayTrayItemView.diagLog.warning(
+                "\(actionName): rejected activation for \(item.logString): \(reason)"
+            )
+        }
+    }
+
+    private func logActivationCompletion(
+        actionName: String,
+        clickStartTime: Date,
+        path: String
+    ) {
+        let duration = Date.now.timeIntervalSince(clickStartTime)
+        OverlayTrayItemView.diagLog.debug(
+            "\(actionName): completed in \(Int(duration * 1000))ms (\(path))"
+        )
     }
 
     private var image: NSImage? {
@@ -775,6 +816,13 @@ private struct OverlayTrayItemView: View {
     private var iconSide: CGFloat {
         guard let maxHeight, maxHeight > 0 else { return 18 }
         return min(maxHeight - 8, 22)
+    }
+
+    private var clickTargetSize: CGSize {
+        if let image {
+            return targetSize(for: image)
+        }
+        return CGSize(width: iconSide + 10, height: maxHeight ?? iconSide)
     }
 
     private func targetSize(for image: NSImage) -> CGSize {
@@ -814,6 +862,7 @@ private struct OverlayTrayItemView: View {
                         isHovered = hovering
                     }
                 )
+                .frame(width: clickTargetSize.width, height: clickTargetSize.height)
             }
             .animation(.easeInOut(duration: 0.15), value: isHovered)
             .accessibilityLabel(item.displayName)
@@ -828,8 +877,8 @@ private struct OverlayTrayItemView: View {
     /// to nothing and the panel renders as a 1-2px sliver.
     /// SF Symbol for system modules (Wi-Fi, Bluetooth, Clock, …) so the tray
     /// shows a distinct glyph rather than the identical Control Center app icon.
-    private var systemSymbolName: String? {
-        MenuBarSystemMenuExtraMetadata.symbolName(for: item)
+    private var systemIcon: MenuBarSystemMenuExtraIcon? {
+        MenuBarSystemMenuExtraMetadata.icon(for: item)
     }
 
     @ViewBuilder
@@ -841,10 +890,8 @@ private struct OverlayTrayItemView: View {
                 .antialiased(true)
                 .resizable()
                 .frame(width: size.width, height: size.height)
-        } else if let systemSymbolName {
-            Image(systemName: systemSymbolName)
-                .font(.system(size: iconSide * 0.8, weight: .regular))
-                .frame(width: iconSide, height: maxHeight, alignment: .center)
+        } else if let systemIcon {
+            SystemMenuExtraTrayIconView(icon: systemIcon, iconSide: iconSide, maxHeight: maxHeight)
                 .padding(.horizontal, 5)
         } else if let fallbackIcon {
             Image(nsImage: fallbackIcon)
@@ -864,7 +911,70 @@ private struct OverlayTrayItemView: View {
     }
 }
 
+private struct SystemMenuExtraTrayIconView: View {
+    let icon: MenuBarSystemMenuExtraIcon
+    let iconSide: CGFloat
+    let maxHeight: CGFloat?
+
+    var body: some View {
+        if let image = icon.nsImage {
+            Image(nsImage: image)
+                .renderingMode(.template)
+                .interpolation(.high)
+                .antialiased(true)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: iconSide, height: iconSide)
+                .frame(height: maxHeight, alignment: .center)
+        } else if let systemSymbolName = icon.systemSymbolName {
+            Image(systemName: systemSymbolName)
+                .font(.system(size: iconSide * 0.8, weight: .regular))
+                .frame(width: iconSide, height: maxHeight, alignment: .center)
+        }
+    }
+}
+
 // MARK: - OverlayTrayItemClickView
+
+enum OverlayTrayClickGesturePolicy {
+    private static let maximumClickDuration: TimeInterval = 0.5
+    private static let maximumClickMovement: CGFloat = 5
+
+    static func shouldActivate(
+        mouseDownDate: Date?,
+        mouseDownLocation: CGPoint?,
+        mouseUpDate: Date,
+        mouseUpLocation: CGPoint,
+        bounds: CGRect
+    ) -> Bool {
+        guard
+            let mouseDownDate,
+            let mouseDownLocation,
+            bounds.contains(mouseDownLocation),
+            bounds.contains(mouseUpLocation)
+        else {
+            return false
+        }
+
+        let duration = mouseUpDate.timeIntervalSince(mouseDownDate)
+        return duration >= 0 &&
+            duration < maximumClickDuration &&
+            mouseDownLocation.distance(to: mouseUpLocation) < maximumClickMovement
+    }
+}
+
+enum OverlayTrayHotCornerParkingPolicy {
+    static func parkingPoint(
+        for location: CGPoint,
+        screenFrames: [CGRect]
+    ) -> CGPoint? {
+        let safePoint = MenuBarMoveGeometryPolicy.hotCornerSafePoint(
+            location,
+            screenFrames: screenFrames
+        )
+        return safePoint == location ? nil : safePoint
+    }
+}
 
 private struct OverlayTrayItemClickView: NSViewRepresentable {
     final class Represented: NSView {
@@ -875,11 +985,11 @@ private struct OverlayTrayItemClickView: NSViewRepresentable {
         var rightClickAction: () -> Void
         var onHover: (Bool) -> Void
 
-        private var lastLeftMouseDownDate = Date.now
-        private var lastRightMouseDownDate = Date.now
+        private var lastLeftMouseDownDate: Date?
+        private var lastRightMouseDownDate: Date?
 
-        private var lastLeftMouseDownLocation = CGPoint.zero
-        private var lastRightMouseDownLocation = CGPoint.zero
+        private var lastLeftMouseDownLocation: CGPoint?
+        private var lastRightMouseDownLocation: CGPoint?
 
         private lazy var tooltipController = CustomTooltipController(text: item.displayName, view: self)
         private var tooltipTrackingArea: NSTrackingArea?
@@ -947,36 +1057,62 @@ private struct OverlayTrayItemClickView: NSViewRepresentable {
         }
 
         override func mouseDown(with event: NSEvent) {
-            super.mouseDown(with: event)
             tooltipController.cancel()
+            let location = convert(event.locationInWindow, from: nil)
+            guard bounds.contains(location) else {
+                lastLeftMouseDownDate = nil
+                lastLeftMouseDownLocation = nil
+                return
+            }
+
             lastLeftMouseDownDate = .now
-            lastLeftMouseDownLocation = NSEvent.mouseLocation
+            lastLeftMouseDownLocation = location
         }
 
         override func rightMouseDown(with event: NSEvent) {
-            super.rightMouseDown(with: event)
             tooltipController.cancel()
+            let location = convert(event.locationInWindow, from: nil)
+            guard bounds.contains(location) else {
+                lastRightMouseDownDate = nil
+                lastRightMouseDownLocation = nil
+                return
+            }
+
             lastRightMouseDownDate = .now
-            lastRightMouseDownLocation = NSEvent.mouseLocation
+            lastRightMouseDownLocation = location
         }
 
         override func mouseUp(with event: NSEvent) {
-            super.mouseUp(with: event)
-            guard
-                Date.now.timeIntervalSince(lastLeftMouseDownDate) < 0.5,
-                lastLeftMouseDownLocation.distance(to: NSEvent.mouseLocation) < 5
-            else {
+            let location = convert(event.locationInWindow, from: nil)
+            let shouldActivate = OverlayTrayClickGesturePolicy.shouldActivate(
+                mouseDownDate: lastLeftMouseDownDate,
+                mouseDownLocation: lastLeftMouseDownLocation,
+                mouseUpDate: .now,
+                mouseUpLocation: location,
+                bounds: bounds
+            )
+            lastLeftMouseDownDate = nil
+            lastLeftMouseDownLocation = nil
+
+            guard shouldActivate else {
                 return
             }
             leftClickAction()
         }
 
         override func rightMouseUp(with event: NSEvent) {
-            super.rightMouseUp(with: event)
-            guard
-                Date.now.timeIntervalSince(lastRightMouseDownDate) < 0.5,
-                lastRightMouseDownLocation.distance(to: NSEvent.mouseLocation) < 5
-            else {
+            let location = convert(event.locationInWindow, from: nil)
+            let shouldActivate = OverlayTrayClickGesturePolicy.shouldActivate(
+                mouseDownDate: lastRightMouseDownDate,
+                mouseDownLocation: lastRightMouseDownLocation,
+                mouseUpDate: .now,
+                mouseUpLocation: location,
+                bounds: bounds
+            )
+            lastRightMouseDownDate = nil
+            lastRightMouseDownLocation = nil
+
+            guard shouldActivate else {
                 return
             }
             rightClickAction()

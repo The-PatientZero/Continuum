@@ -18,6 +18,7 @@ import Foundation
 /// fallback, popup capture, context append, and rehide trigger scheduling.
 enum MenuBarTemporaryRevealExecutor {
     private static let fastMoveAttemptBudget = 2
+    private static let secondaryClickMoveAttemptBudget = 1
     private static let initialClickAttemptBudget = 1
     private static let fallbackClickAttemptBudget = 3
 
@@ -86,6 +87,14 @@ enum MenuBarTemporaryRevealExecutor {
     ) async -> Outcome {
         diagnostics.recordStart(item)
 
+        if mouseButton != .left, operations.hasTemporaryContexts() {
+            diagnostics.recordAdmissionBlocked(
+                operations.outstandingContexts().map(\.tag)
+            )
+            operations.scheduleRehideTimer()
+            return Outcome(result: .showFailed)
+        }
+
         if operations.hasTemporaryContexts() {
             operations.cancelRehideTriggers()
             await operations.forceRehideExistingContexts()
@@ -115,7 +124,7 @@ enum MenuBarTemporaryRevealExecutor {
             return Outcome(result: .showFailed)
         }
 
-        guard let anchor = MenuBarTemporaryRevealPolicy.revealAnchor(in: items) else {
+        guard let anchor = MenuBarTemporaryRevealPolicy.revealAnchor(for: item, in: items) else {
             diagnostics.recordMissingRevealAnchor(item)
             operations.showNoRoomAlert(item)
             return Outcome(result: .showFailed)
@@ -149,7 +158,7 @@ enum MenuBarTemporaryRevealExecutor {
                 item,
                 moveDestination,
                 resolvedDisplayID,
-                fastPath ? fastMoveAttemptBudget : nil
+                moveAttemptBudget(mouseButton: mouseButton, fastPath: fastPath)
             )
         } catch {
             diagnostics.recordMoveFailure(item, error)
@@ -181,7 +190,6 @@ enum MenuBarTemporaryRevealExecutor {
             returnRoute: returnRoute
         )
         operations.appendContext(context)
-
         operations.cancelRehideTriggers()
         defer {
             operations.scheduleRehideTimer()
@@ -261,5 +269,15 @@ enum MenuBarTemporaryRevealExecutor {
         let clickTarget = await operations.refreshedClickTarget(item, resolvedDisplayID)
         await operations.sleep(MenuBarEventPacingPolicy.revealedItemPostMoveProcessingDelay)
         return clickTarget
+    }
+
+    private static func moveAttemptBudget(
+        mouseButton: CGMouseButton,
+        fastPath: Bool
+    ) -> Int? {
+        guard mouseButton == .left else {
+            return secondaryClickMoveAttemptBudget
+        }
+        return fastPath ? fastMoveAttemptBudget : nil
     }
 }

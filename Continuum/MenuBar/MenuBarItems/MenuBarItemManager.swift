@@ -1429,6 +1429,13 @@ extension MenuBarItemManager {
         return location
     }
 
+    private nonisolated func getHotCornerSafeMouseLocation() throws -> CGPoint {
+        MenuBarMoveGeometryPolicy.hotCornerSafePoint(
+            try getMouseLocation(),
+            screenFrames: NSScreen.screens.map { CGDisplayBounds($0.displayID) }
+        )
+    }
+
     /// Returns the process identifier that can be used to create
     /// and post a menu bar item event.
     private nonisolated func getEventPID(for item: MenuBarItem) -> pid_t {
@@ -1613,7 +1620,7 @@ extension MenuBarItemManager {
         // Capture mouse location only when this call owns the cursor warp.
         // When called from move(), the outer move() handles the single warp
         // at the end of all attempts so the cursor doesn't oscillate per attempt.
-        let mouseLocation: CGPoint? = warpCursorAfter ? try getMouseLocation() : nil
+        let mouseLocation: CGPoint? = warpCursorAfter ? try getHotCornerSafeMouseLocation() : nil
         let source = try MenuBarEventSourceRuntime.source()
 
         try MenuBarEventSourceRuntime.permitLocalEvents()
@@ -1861,7 +1868,7 @@ extension MenuBarItemManager {
                     self.syntheticEventRuntime.shouldManageCursor
                 },
                 mouseLocation: {
-                    try self.getMouseLocation()
+                    try self.getHotCornerSafeMouseLocation()
                 },
                 hideCursor: { timeout in
                     MouseHelpers.hideCursor(watchdogTimeout: timeout)
@@ -1975,7 +1982,7 @@ extension MenuBarItemManager {
         let clickBounds = try await getCurrentBounds(for: item)
         let clickPoint = MenuBarClickTargetPolicy.clickPoint(for: clickBounds)
 
-        let mouseLocation = try getMouseLocation()
+        let mouseLocation = try getHotCornerSafeMouseLocation()
         let source = try MenuBarEventSourceRuntime.source()
 
         try MenuBarEventSourceRuntime.permitLocalEvents()
@@ -2003,14 +2010,16 @@ extension MenuBarItemManager {
             throw MenuBarEventError.eventCreationFailure(item)
         }
 
+        MouseHelpers.hideCursor(watchdogTimeout: .seconds(10))
         // Warp the cursor to the click point so the Window Server's hit-test
         // matches the event coordinates rather than the cursor's current position.
+        // Hide/decouple first so this synthetic warp cannot visibly enter a
+        // user-configured macOS hot corner.
         MouseHelpers.warpCursor(to: clickPoint)
         // Small delay to let the Window Server process the warp before posting
         // the event. Without this, the event can be routed using the cursor's
         // old position (e.g. the Apple menu) instead of the warped target.
         try await Task.sleep(for: MenuBarEventPacingPolicy.clickWarpSettleDelay)
-        MouseHelpers.hideCursor()
         defer {
             MouseHelpers.warpCursor(to: mouseLocation)
             MouseHelpers.showCursor()
@@ -2063,7 +2072,12 @@ extension MenuBarItemManager {
     ///   - item: The menu bar item to activate.
     ///   - displayID: The display whose menu bar hosts a temporary reveal for
     ///     off-screen items.
-    func activate(item: MenuBarItem, on displayID: CGDirectDisplayID?) async {
+    func activate(
+        item: MenuBarItem,
+        on displayID: CGDirectDisplayID?,
+        mouseButton: CGMouseButton = .left,
+        fastPath: Bool = false
+    ) async {
         switch MenuBarClickTargetPolicy.activationRoute(
             itemIsOnScreen: Bridging.isWindowOnScreen(item.windowID)
         ) {
@@ -2074,19 +2088,24 @@ extension MenuBarItemManager {
             // open/close toggle and works with popover-style menus (e.g. Cap,
             // MenuTool) that a stray AX interaction would disturb.
             if MenuBarClickTargetPolicy.shouldAttemptAccessibilityPress(
-                mouseButton: .left,
+                mouseButton: mouseButton,
                 isElectronItem: isElectronItem(item)
             ), pressItemViaAccessibility(item) {
                 MenuBarItemManager.diagLog.info("Activated \(item.logString) via AX press")
                 return
             }
             do {
-                try await click(item: item, with: .left)
+                try await click(item: item, with: mouseButton)
             } catch {
                 MenuBarItemManager.diagLog.error("Failed to activate \(item.logString): \(error)")
             }
         case .temporarilyReveal:
-            await temporarilyShow(item: item, clickingWith: .left, on: displayID)
+            await temporarilyShow(
+                item: item,
+                clickingWith: mouseButton,
+                on: displayID,
+                fastPath: fastPath
+            )
         }
     }
 
@@ -2099,7 +2118,9 @@ extension MenuBarItemManager {
     @discardableResult
     func activateItem(
         withIdentifier identifier: String,
-        on displayID: CGDirectDisplayID?
+        on displayID: CGDirectDisplayID?,
+        mouseButton: CGMouseButton = .left,
+        fastPath: Bool = false
     ) async -> MenuBarRuntimeCommandPolicy.ActivationDecision {
         let inventory = currentRuntimeInventory()
         guard inventory.item(withIdentifier: identifier) != nil else {
@@ -2136,7 +2157,12 @@ extension MenuBarItemManager {
 
         switch decision {
         case .allow:
-            await activate(item: item, on: displayID)
+            await activate(
+                item: item,
+                on: displayID,
+                mouseButton: mouseButton,
+                fastPath: fastPath
+            )
         case let .reject(reason):
             MenuBarItemManager.diagLog.info(
                 "Cannot activate menu bar item; \(reason)"
@@ -2162,10 +2188,7 @@ extension MenuBarItemManager {
         return FileManager.default.fileExists(atPath: electronFramework.path)
     }
 
-    /// Attempts to open the item's menu by performing an Accessibility press on
-    /// its status item element. Returns false (so the caller can fall back to
-    /// a synthetic click) when the element cannot be resolved or the press fails.
-    private func pressItemViaAccessibility(_ item: MenuBarItem) -> Bool {
+    private func accessibilityTarget(for item: MenuBarItem) -> UIElement? {
         // Fall back to ownerPID so this works during startup before sourcePID
         // has been resolved.
         let pid = item.sourcePID ?? item.ownerPID
@@ -2174,7 +2197,7 @@ extension MenuBarItemManager {
             let app = AXHelpers.application(for: runningApp),
             let extrasMenuBar = AXHelpers.extrasMenuBar(for: app)
         else {
-            return false
+            return nil
         }
 
         let children = AXHelpers.children(for: extrasMenuBar)
@@ -2186,18 +2209,26 @@ extension MenuBarItemManager {
             )
         }
 
-        let target: UIElement
         switch MenuBarAccessibilityPressPolicy.targetCandidate(
             for: itemBounds,
             candidates: candidates
         ) {
         case .noTarget:
-            return false
+            return nil
         case let .useCandidate(index):
             guard children.indices.contains(index) else {
-                return false
+                return nil
             }
-            target = children[index]
+            return children[index]
+        }
+    }
+
+    /// Attempts to open the item's menu by performing an Accessibility press on
+    /// its status item element. Returns false (so the caller can fall back to
+    /// a synthetic click) when the element cannot be resolved or the press fails.
+    private func pressItemViaAccessibility(_ item: MenuBarItem) -> Bool {
+        guard let target = accessibilityTarget(for: item) else {
+            return false
         }
 
         return AXHelpers.press(target)
@@ -2664,7 +2695,8 @@ extension MenuBarItemManager {
                         item: item,
                         to: destination,
                         on: displayID,
-                        skipInputPause: true
+                        skipInputPause: true,
+                        maxMoveAttempts: 1
                     )
                 },
                 clearPendingRelocation: { tagIdentifier in

@@ -23,6 +23,7 @@ struct MenuBarSnapshotItem: Hashable {
     let bounds: CGRect
     let isOnScreen: Bool
     let confidence: MenuBarIdentityConfidence
+    let allowsAutomatedMove: Bool
 
     init(section: MenuBarSection.Name, item: MenuBarItem) {
         self.section = section
@@ -34,6 +35,7 @@ struct MenuBarSnapshotItem: Hashable {
         self.bounds = item.bounds
         self.isOnScreen = item.isOnScreen
         self.confidence = item.identityConfidence
+        self.allowsAutomatedMove = item.identityConfidence.allowsAutomatedMove && item.isMovable
     }
 }
 
@@ -67,7 +69,7 @@ struct MenuBarSnapshot: Hashable {
 
     var blockedItems: [MenuBarSnapshotItem] {
         items.filter {
-            $0.confidence.allowsAutomatedMove &&
+            $0.allowsAutomatedMove &&
                 MenuBarCacheCommitPolicy.isBlockedWindowBounds($0.bounds)
         }
     }
@@ -77,7 +79,7 @@ struct MenuBarSnapshot: Hashable {
     }
 
     var movableItems: [MenuBarSnapshotItem] {
-        items.filter(\.confidence.allowsAutomatedMove)
+        items.filter(\.allowsAutomatedMove)
     }
 
     var isActionable: Bool {
